@@ -18,20 +18,18 @@ namespace Sql2Parquet
 
         private static RootCommand CreateCommand()
         {
-            // sql2parquet --connect "Server=.\MSSQL2019; Database=HP_Muppet_Reporting_Dev; Integrated Security=true; Trusted Connection=true;" --query "/path/to/query/dir/*.sql" --output "/path/to/parquet/output"
-
             var rootCommand = new RootCommand("sql2parquet: Export results of SQL queries to Apache Parquet files");
 
             var connectionStringOption = new Option<string>(
                 name: "--connection",                
-                description: "The SQL Server connection string to use."                
+                description: "The managed ADO.NET connection string to use."                
             )
-            { IsRequired = true, ArgumentHelpName = "connection string" };            
+            { IsRequired = true, ArgumentHelpName = "connStr" };            
             rootCommand.AddOption(connectionStringOption);
 
             var queryPathOption = new Option<string>(
                 name: "--query",
-                description: $"The path to text file(s) containing the SQL query to execute. Defaults to using [*.sql] files in the current working directory [{Environment.CurrentDirectory}]."
+                description: $"The file or directory path to text file(s) containing the SQL query to execute. Defaults to using [*.sql] files in the current working directory [{Environment.CurrentDirectory}]."
             )
             { ArgumentHelpName = "/path/to/*.sql" };
             rootCommand.AddOption(queryPathOption);
@@ -42,10 +40,18 @@ namespace Sql2Parquet
             );
             rootCommand.AddOption(outputPathOption);
 
+            var driverOption = new Option<DefaultDbProviderFactory.Drivers>(
+                name: "--driver",
+                description: "The database driver to use.")
+            { ArgumentHelpName = $"{string.Join('|', Enum.GetNames<DefaultDbProviderFactory.Drivers>())}"};
+            driverOption.SetDefaultValue(default(DefaultDbProviderFactory.Drivers));
+            rootCommand.AddOption(driverOption);
+
             var tempPathOption = new Option<string>(
                 name: "--temp",
                 description: "The path where files in-progress will be temporarily written to before it is moved to the final output path."
-            );
+            )
+            { ArgumentHelpName = "/path/to/temp" };
             rootCommand.AddOption(tempPathOption);
 
             rootCommand.SetHandler(async (context) =>
@@ -53,8 +59,9 @@ namespace Sql2Parquet
                 string connectionString = context.ParseResult.GetValueForOption(connectionStringOption);
                 string queryPath = context.ParseResult.GetValueForOption(queryPathOption);
                 string outputPath = context.ParseResult.GetValueForOption(outputPathOption);
+                var driver = context.ParseResult.GetValueForOption(driverOption);
                 string tempPath = context.ParseResult.GetValueForOption(tempPathOption);
-                var args = await CreateArgs(connectionString, queryPath, outputPath, tempPath);
+                var args = await CreateArgs(connectionString, queryPath, outputPath, driver, tempPath);
 
                 context.ExitCode = await Command.Execute(args);
             });
@@ -62,13 +69,14 @@ namespace Sql2Parquet
             return rootCommand;
         }
 
-        private static async Task<Command.Args> CreateArgs(string connectionString, string queryPath, string outputPath, string tempPath)
+        private static async Task<Command.Args> CreateArgs(string connectionString, string queryPath, string outputPath, DefaultDbProviderFactory.Drivers driver, string tempPath)
         {
             return new Command.Args
             {
                 ConnectionString = connectionString,
                 Queries = await ResolveQueriesFrom(queryPath),
                 OutputPath = ResolveValidDir(outputPath, Path.Combine(Environment.CurrentDirectory, ".output")),
+                Driver = driver,
                 TempPath = ResolveValidDir(tempPath, Path.Combine(Environment.CurrentDirectory, ".temp", Guid.NewGuid().ToString()))
             };
         }

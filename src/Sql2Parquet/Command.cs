@@ -3,6 +3,8 @@ using Parquet;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -13,28 +15,36 @@ namespace Sql2Parquet
     {
         public static async Task<int> Execute(Args args)
         {
-            var parquetFiles = new ConcurrentBag<string>();
+            var tempDir = new DirectoryInfo(args.TempPath);
+            var parquetFiles = new ConcurrentBag<FileInfo>();
 
             foreach (var query in args.Queries)
             {
-                string tempResultPath = await ExportToParquet(args.ConnectionString, query, args.TempPath);
-                parquetFiles.Add(tempResultPath);
+                var exportContext = new ParquetExportContext(tempDir);
+
+                using (var conn = await DefaultDbProviderFactory.OpenDbConnection(args.ConnectionString))
+                {
+                    var tempResult = await exportContext.StartAsync(name: query.Key, sqlText: query.Value, conn);
+                    parquetFiles.Add(tempResult);
+                }
             }
 
             // move all generated parquet files to final destination
-            foreach (var filename in parquetFiles)
+            foreach (var parquetFile in parquetFiles)
             {
-                var newParquetFile = new FileInfo(filename);
-                string newPath = Path.Combine(args.OutputPath, newParquetFile.Name);
+                string newPath = Path.Combine(args.OutputPath, parquetFile.Name);
 
-                MoveOutput(newParquetFile, newPath, args.FilesToKeep);                
-                Directory.Delete(newParquetFile.Directory.FullName);
+                MoveOutput(parquetFile, newPath);
+                PruneOldFiles(newPath, args.FilesToKeep);
+                Directory.Delete(parquetFile.Directory.FullName);
             }
 
             return 0;
         }
 
-        private static void MoveOutput(FileInfo sourceFile, string newPath, int filesToKeep)
+        
+
+        private static void MoveOutput(FileInfo sourceFile, string newPath)
         {
             if (File.Exists(newPath))
             {
@@ -45,7 +55,10 @@ namespace Sql2Parquet
             }
 
             File.Move(sourceFile.FullName, newPath);
+        }
 
+        private static void PruneOldFiles(string newPath, int filesToKeep)
+        {
             // prune old files
             var newFile = new FileInfo(newPath);
             string searchPattern = $"{Path.GetFileNameWithoutExtension(newFile.Name)}.*{Path.GetExtension(newFile.Name)}";
@@ -60,52 +73,6 @@ namespace Sql2Parquet
             }
         }
 
-        private static async Task<string> ExportToParquet(string connectionString, KeyValuePair<string, string> query, string tempPath)
-        {
-            string outputFilename = $"{query.Key}.parquet";
-            string outputPath = Path.Combine(tempPath, outputFilename);
-
-            using (var conn = new SqlConnection(connectionString))
-            using (var cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = query.Value;
-                conn.Open();
-
-                using (var reader = await cmd.ExecuteReaderAsync())
-                {
-                    // Fetch column schema
-                    var columnSchema = await reader.GetColumnSchemaAsync();
-                    var rowGroup = RowGroupBuilder.CreateInstance(columnSchema);
-
-                    using (Stream fileStream = File.OpenWrite(outputPath))
-                    using (var writer = await ParquetWriter.CreateAsync(rowGroup.Schema, fileStream))
-                    {
-                        writer.CompressionMethod = CompressionMethod.Gzip;
-                        writer.CompressionLevel = System.IO.Compression.CompressionLevel.Optimal;
-
-                        while (await reader.ReadAsync())
-                        {
-                            rowGroup.AddRow(reader);
-
-                            // flush 50k rows at a time.
-                            if (rowGroup.RowCount == 50000)
-                            {
-                                await rowGroup.WriteTo(writer);
-                            }
-                        }
-
-                        // flush remaining rows to file.
-                        if (rowGroup.RowCount > 0)
-                        {
-                            await rowGroup.WriteTo(writer);
-                        }
-                    }
-                }
-            }
-
-            return outputPath;
-        }
-        
         public class Args
         {
             public Args()
@@ -113,6 +80,7 @@ namespace Sql2Parquet
                 Queries = new Dictionary<string, string>();
                 RequestDate = DateTimeOffset.UtcNow;
                 FilesToKeep = 5;
+                Driver = DefaultDbProviderFactory.Drivers.MSSQL;
             }
 
             public string ConnectionString { get; set; }
@@ -121,6 +89,7 @@ namespace Sql2Parquet
             public string OutputPath { get; set; }
             public string TempPath { get; set; }
             public int FilesToKeep { get; set; }
+            public DefaultDbProviderFactory.Drivers Driver { get; set; }
         }
     }
 }
