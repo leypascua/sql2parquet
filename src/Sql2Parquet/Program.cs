@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.CommandLine;
 using System.IO;
 using System.Reflection.Metadata.Ecma335;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Sql2Parquet
@@ -11,12 +12,27 @@ namespace Sql2Parquet
     {
         static async Task<int> Main(string[] args)
         {
-            var rootCommand = CreateCommand();
+            var cts = new CancellationTokenSource();
+
+            // Register to handle Ctrl+C and SIGTERM signals
+            Console.CancelKeyPress += (sender, eventArgs) =>
+            {
+                Console.WriteLine("Ctrl+C pressed. Initiating shutdown...");
+                cts.Cancel();
+                eventArgs.Cancel = true; // Prevent immediate termination
+            };
+
+            AppDomain.CurrentDomain.ProcessExit += (sender, eventArgs) =>
+            {
+                cts.Cancel();
+            };
+            
+            var rootCommand = CreateCommand(cts.Token);
 
             return await rootCommand.InvokeAsync(args);
         }
 
-        private static RootCommand CreateCommand()
+        private static RootCommand CreateCommand(CancellationToken cancellationToken)
         {
             var rootCommand = new RootCommand("sql2parquet: Export results of SQL queries to Apache Parquet files");
 
@@ -63,7 +79,7 @@ namespace Sql2Parquet
                 string tempPath = context.ParseResult.GetValueForOption(tempPathOption);
                 var args = await CreateArgs(connectionString, queryPath, outputPath, driver, tempPath);
 
-                context.ExitCode = await Command.Execute(args);
+                context.ExitCode = await Command.Execute(args, cancellationToken);
             });
 
             return rootCommand;

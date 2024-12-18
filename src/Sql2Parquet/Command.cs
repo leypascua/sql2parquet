@@ -1,5 +1,6 @@
 ﻿using Microsoft.Data.SqlClient;
 using Parquet;
+using Spectre.Console;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -7,28 +8,69 @@ using System.Data;
 using System.Data.Common;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using static Sql2Parquet.Command;
 
 namespace Sql2Parquet
 {
     public static class Command
     {
-        public static async Task<int> Execute(Args args)
+        public static async Task<int> Execute(Args args, CancellationToken cancellationToken)
         {
-            var tempDir = new DirectoryInfo(args.TempPath);
             var parquetFiles = new ConcurrentBag<FileInfo>();
+            var tempDir = new DirectoryInfo(Path.Combine(args.TempPath, Guid.NewGuid().ToString()));
 
-            foreach (var query in args.Queries)
+            if (!tempDir.Exists)
             {
-                var exportContext = new ParquetExportContext(tempDir);
-
-                using (var conn = await DefaultDbProviderFactory.OpenDbConnection(args.ConnectionString))
-                {
-                    var tempResult = await exportContext.StartAsync(name: query.Key, sqlText: query.Value, conn);
-                    parquetFiles.Add(tempResult);
-                }
+                tempDir.Create();
             }
 
+            await AnsiConsole.Progress()
+                .AutoRefresh(true)
+                .AutoClear(false)
+                .HideCompleted(false)
+                .Columns([
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new SpinnerColumn()
+                ])
+                .StartAsync(async (ctx) =>
+                {
+                    // Define tasks
+                    var tasks = StartTasks(tempDir, args, ctx, cancellationToken)
+                        .ToDictionary(t => t.Task.Id);
+
+                    while (tasks.Any())
+                    {   
+                        var completedTask = await Task.WhenAny(tasks.Values.Select(t => t.Task));
+                        var exportTask = tasks[completedTask.Id];
+
+                        try
+                        {
+                            FileInfo tempParquetFile = await completedTask;
+
+                            if (tempParquetFile.Exists)
+                            {
+                                parquetFiles.Add(tempParquetFile);
+                            }
+
+                            exportTask.SetFinished();
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            exportTask.SetError("Operation cancelled.");
+                        }
+                        catch (Exception ex)
+                        {
+                            exportTask.SetError(ex.Message);
+                        }
+
+                        tasks.Remove(completedTask.Id);
+                    }
+                });
+
+            AnsiConsole.Console.WriteLine("Finalizing...");
             // move all generated parquet files to final destination
             foreach (var parquetFile in parquetFiles)
             {
@@ -36,13 +78,23 @@ namespace Sql2Parquet
 
                 MoveOutput(parquetFile, newPath);
                 PruneOldFiles(newPath, args.FilesToKeep);
-                Directory.Delete(parquetFile.Directory.FullName);
             }
+
+            AnsiConsole.Console.WriteLine("Cleaning up");
+            tempDir.Delete();
+            AnsiConsole.Console.WriteLine("Done.");
 
             return 0;
         }
 
-        
+        private static IEnumerable<ExportTask> StartTasks(DirectoryInfo tempDir, Args args, ProgressContext progress, CancellationToken cancellationToken)
+        {
+            foreach (var query in args.Queries)
+            {
+                yield return new ExportTask(tempDir, query.Key, query.Value, args, progress)
+                    .Start(cancellationToken); 
+            }
+        }
 
         private static void MoveOutput(FileInfo sourceFile, string newPath)
         {

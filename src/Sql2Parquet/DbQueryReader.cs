@@ -10,6 +10,7 @@ namespace Sql2Parquet
 {
     public interface IDbQueryReader
     {
+        int RecordsAffected { get; }
         Task<bool> ReadAsync();
         Task<ReadOnlyCollection<DbColumn>> GetColumnSchemaAsync();
         object GetValue(int ordinal);
@@ -38,5 +39,7 @@ namespace Sql2Parquet
         {
             return _reader.GetValue(ordinal);
         }
+
+        public int RecordsAffected => _reader.RecordsAffected;
     }
 }
